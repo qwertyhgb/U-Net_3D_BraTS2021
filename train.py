@@ -65,7 +65,7 @@ def parse_args():
                         help='是否使用分布式训练，多GPU训练')
     parser.add_argument('--local_rank', type=int, default=-1,
                         help='分布式训练的本地排名，由torch.distributed.launch设置')
-    parser.add_argument('--num_workers', type=int, default=4,
+    parser.add_argument('--num_workers', type=int, default=2,
                         help='数据加载器的工作进程数，用于并行数据加载')
     
     # 混合精度训练
@@ -520,7 +520,7 @@ def main():
     
     # 创建学习率调度器
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.5, patience=5, verbose=True
+        optimizer, mode='max', factor=0.5, patience=5
     )
     
     # 获取损失函数
