@@ -646,7 +646,7 @@ class BraTSDataset(Dataset):
                     cropped_modalities[modality], seg = crop_brain_region(image, seg)
                 else:
                     # 对其他模态单独裁剪
-                    cropped_modalities[modality], _ = crop_brain_region(image)
+                    cropped_modalities[modality] = crop_brain_region(image)
             
             # ==================== 重采样到统一尺寸 ====================
             # 将所有数据重采样到目标尺寸，便于批处理

@@ -527,7 +527,7 @@ def main():
     loss_fn = get_loss_function()
     
     # 创建混合精度训练的缩放器
-    scaler = GradScaler() if args.amp else None
+    scaler = GradScaler('cuda') if args.amp else None
     
     # 创建TensorBoard写入器
     if args.rank == 0:
