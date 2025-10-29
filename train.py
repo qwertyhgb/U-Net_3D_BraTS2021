@@ -492,7 +492,13 @@ def main():
     setup_distributed(args)
     
     # 设置设备
-    device = torch.device(f'cuda:{args.local_rank}' if torch.cuda.is_available() else 'cpu')
+    if torch.cuda.is_available():
+        if args.local_rank >= 0:
+            device = torch.device(f'cuda:{args.local_rank}')
+        else:
+            device = torch.device('cuda')
+    else:
+        device = torch.device('cpu')
     
     # 获取数据加载器
     train_loader, val_loader, test_loader = get_data_loaders(
