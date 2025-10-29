@@ -47,7 +47,7 @@ def parse_args():
                         help='是否使用残差连接，有助于训练更深的网络')
     
     # 训练参数
-    parser.add_argument('--batch_size', type=int, default=2,
+    parser.add_argument('--batch_size', type=int, default=1,
                         help='批量大小，受GPU内存限制')
     parser.add_argument('--epochs', type=int, default=100,
                         help='训练轮数，总训练次数')
@@ -65,7 +65,7 @@ def parse_args():
                         help='是否使用分布式训练，多GPU训练')
     parser.add_argument('--local_rank', type=int, default=-1,
                         help='分布式训练的本地排名，由torch.distributed.launch设置')
-    parser.add_argument('--num_workers', type=int, default=2,
+    parser.add_argument('--num_workers', type=int, default=0,
                         help='数据加载器的工作进程数，用于并行数据加载')
     
     # 混合精度训练
@@ -341,11 +341,15 @@ def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler=None, use_
         # 累计当前批次的损失
         epoch_loss += loss.item()
         
-        # 可选：打印批次进度（每10%打印一次）
-        if batch_idx % (num_batches // 10 + 1) == 0:
+        # 打印每个批次的进度，帮助调试
+        if batch_idx % max(1, num_batches // 20) == 0:
             progress = 100.0 * batch_idx / num_batches
             print(f'训练进度: {progress:.1f}% ({batch_idx}/{num_batches}), '
                   f'当前批次损失: {loss.item():.4f}')
+            
+        # 每个批次都打印简单进度（前10个批次）
+        if batch_idx < 10:
+            print(f'批次 {batch_idx+1}/{num_batches} 完成，损失: {loss.item():.4f}')
     
     # 计算并返回平均损失
     avg_epoch_loss = epoch_loss / num_batches
