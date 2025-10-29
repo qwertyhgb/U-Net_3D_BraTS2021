@@ -10,6 +10,7 @@ import torch.distributed as dist  # 分布式训练
 from torch.nn.parallel import DistributedDataParallel as DDP  # 分布式数据并行
 from torch.utils.data.distributed import DistributedSampler  # 分布式采样器
 from torch.utils.tensorboard import SummaryWriter  # TensorBoard可视化
+from tqdm import tqdm  # 进度条
 
 # 导入自定义模块
 from models.unet3d import UNet3D  # 3D U-Net模型
@@ -225,7 +226,7 @@ def get_loss_function():
     return combined_loss
 
 
-def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler=None, use_amp=False):
+def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler=None, use_amp=False, epoch_num=0):
     """执行一个训练周期
     
     在一个epoch中遍历所有训练数据，执行前向传播、损失计算、反向传播和参数更新。
@@ -248,6 +249,7 @@ def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler=None, use_
         device (torch.device): 计算设备（CPU或GPU）
         scaler (GradScaler, 可选): 混合精度训练的梯度缩放器
         use_amp (bool): 是否使用自动混合精度训练
+        epoch_num (int): 当前epoch编号
         
     返回:
         float: 当前epoch的平均训练损失
@@ -255,21 +257,56 @@ def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler=None, use_
     # 设置模型为训练模式，启用dropout和batch normalization的训练行为
     model.train()
     
-    # 初始化损失累计器
+    # 初始化统计变量
     epoch_loss = 0.0
     num_batches = len(dataloader)
+    batch_times = []
+    data_load_times = []
+    forward_times = []
+    backward_times = []
+    
+    print(f"\n{'='*60}")
+    print(f"开始训练 Epoch {epoch_num + 1}")
+    print(f"总批次数: {num_batches}")
+    print(f"使用设备: {device}")
+    print(f"混合精度训练: {'启用' if use_amp else '禁用'}")
+    print(f"{'='*60}")
+    
+    epoch_start_time = time.time()
+    
+    # 创建训练进度条
+    train_pbar = tqdm(
+        enumerate(dataloader), 
+        total=num_batches,
+        desc=f"Epoch {epoch_num + 1}/{epoch_num + 1} - 训练",
+        unit="batch",
+        ncols=120,
+        leave=False
+    )
     
     # 遍历训练数据批次
-    for batch_idx, batch in enumerate(dataloader):
+    for batch_idx, batch in train_pbar:
+        batch_start_time = time.time()
+        
         # ==================== 数据准备 ====================
+        data_start_time = time.time()
         # 将数据移动到指定设备（GPU或CPU）
         images = batch['image'].to(device, non_blocking=True)  # [B, 4, D, H, W]
         masks = batch['mask'].to(device, non_blocking=True)    # [B, D, H, W]
+        data_load_time = time.time() - data_start_time
+        data_load_times.append(data_load_time)
+        
+        # 打印数据形状信息（前几个批次）
+        if batch_idx < 3:
+            print(f"批次 {batch_idx + 1} - 数据形状: images={list(images.shape)}, masks={list(masks.shape)}")
+            print(f"批次 {batch_idx + 1} - 数据加载时间: {data_load_time:.3f}s")
         
         # 清零梯度，防止梯度累积
         optimizer.zero_grad()
         
         # ==================== 前向传播 ====================
+        forward_start_time = time.time()
+        
         if use_amp:
             # 混合精度训练路径
             with autocast('cuda'):
@@ -291,11 +328,19 @@ def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler=None, use_
                         weight = 0.5 ** (i + 1)
                         aux_loss = loss_fn(aux_output, masks)
                         loss += weight * aux_loss
+                        
+                    if batch_idx < 3:
+                        print(f"批次 {batch_idx + 1} - 深度监督: 主损失={loss_fn(main_output, masks):.4f}, 辅助输出数={len(auxiliary_outputs)}")
                 else:
                     # 标准模式：只有主输出
                     loss = loss_fn(outputs, masks)
             
+            forward_time = time.time() - forward_start_time
+            forward_times.append(forward_time)
+            
             # ==================== 反向传播（混合精度）====================
+            backward_start_time = time.time()
+            
             # 缩放损失以防止梯度下溢
             scaler.scale(loss).backward()
             
@@ -304,6 +349,9 @@ def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler=None, use_
             
             # 更新缩放因子
             scaler.update()
+            
+            backward_time = time.time() - backward_start_time
+            backward_times.append(backward_time)
             
         else:
             # ==================== 标准精度训练路径 ====================
@@ -324,11 +372,19 @@ def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler=None, use_
                     weight = 0.5 ** (i + 1)
                     aux_loss = loss_fn(aux_output, masks)
                     loss += weight * aux_loss
+                    
+                if batch_idx < 3:
+                    print(f"批次 {batch_idx + 1} - 深度监督: 主损失={loss_fn(main_output, masks):.4f}, 辅助输出数={len(auxiliary_outputs)}")
             else:
                 # 标准模式
                 loss = loss_fn(outputs, masks)
             
+            forward_time = time.time() - forward_start_time
+            forward_times.append(forward_time)
+            
             # ==================== 反向传播（标准精度）====================
+            backward_start_time = time.time()
+            
             loss.backward()
             
             # 可选：梯度裁剪，防止梯度爆炸
@@ -336,23 +392,64 @@ def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler=None, use_
             
             # 更新参数
             optimizer.step()
+            
+            backward_time = time.time() - backward_start_time
+            backward_times.append(backward_time)
         
-        # ==================== 损失统计 ====================
+        # ==================== 损失统计和进度显示 ====================
         # 累计当前批次的损失
         epoch_loss += loss.item()
+        batch_time = time.time() - batch_start_time
+        batch_times.append(batch_time)
         
-        # 打印每个批次的进度，帮助调试
-        if batch_idx % max(1, num_batches // 20) == 0:
-            progress = 100.0 * batch_idx / num_batches
-            print(f'训练进度: {progress:.1f}% ({batch_idx}/{num_batches}), '
-                  f'当前批次损失: {loss.item():.4f}')
+        # 更新进度条
+        avg_batch_time = sum(batch_times) / len(batch_times)
+        current_loss = epoch_loss / (batch_idx + 1)
+        
+        # GPU内存使用情况
+        if torch.cuda.is_available():
+            gpu_memory = torch.cuda.memory_allocated(device) / 1024**3  # GB
+            memory_info = f"GPU:{gpu_memory:.1f}GB"
+        else:
+            memory_info = "CPU"
+        
+        # 更新进度条描述
+        train_pbar.set_postfix({
+            'Loss': f'{loss.item():.4f}',
+            'AvgLoss': f'{current_loss:.4f}',
+            'Time': f'{batch_time:.2f}s',
+            'Memory': memory_info,
+            'LR': f'{optimizer.param_groups[0]["lr"]:.1e}'
+        })
+        
+        # 详细信息输出（前几个批次和关键节点）
+        if batch_idx < 3 or batch_idx % max(1, num_batches // 10) == 0:
+            eta_seconds = avg_batch_time * (num_batches - batch_idx - 1)
+            eta_minutes = eta_seconds / 60
             
-        # 每个批次都打印简单进度（前10个批次）
-        if batch_idx < 10:
-            print(f'批次 {batch_idx+1}/{num_batches} 完成，损失: {loss.item():.4f}')
+            tqdm.write(f"[详细] 批次 {batch_idx+1}: 损失={loss.item():.6f}, "
+                      f"数据加载={data_load_times[-1]:.3f}s, "
+                      f"前向={forward_times[-1]:.3f}s, "
+                      f"反向={backward_times[-1]:.3f}s, "
+                      f"ETA={eta_minutes:.1f}min")
     
-    # 计算并返回平均损失
+    # 关闭训练进度条
+    train_pbar.close()
+    
+    # Epoch结束统计
+    epoch_time = time.time() - epoch_start_time
     avg_epoch_loss = epoch_loss / num_batches
+    
+    print(f"\n{'='*60}")
+    print(f"Epoch {epoch_num + 1} 训练完成!")
+    print(f"总时间: {epoch_time:.2f}s ({epoch_time/60:.1f}min)")
+    print(f"平均批次时间: {sum(batch_times)/len(batch_times):.3f}s")
+    print(f"平均数据加载时间: {sum(data_load_times)/len(data_load_times):.3f}s")
+    print(f"平均前向传播时间: {sum(forward_times)/len(forward_times):.3f}s")
+    print(f"平均反向传播时间: {sum(backward_times)/len(backward_times):.3f}s")
+    print(f"平均训练损失: {avg_epoch_loss:.6f}")
+    print(f"{'='*60}\n")
+    
     return avg_epoch_loss
 
 
@@ -393,9 +490,19 @@ def validate(model, dataloader, loss_fn, device, args):
     hausdorff_distances = []
     num_batches = len(dataloader)
     
+    # 创建验证进度条
+    val_pbar = tqdm(
+        enumerate(dataloader),
+        total=num_batches,
+        desc="验证中",
+        unit="batch",
+        ncols=100,
+        leave=False
+    )
+    
     # 禁用梯度计算，节省内存并加速推理
     with torch.no_grad():
-        for batch_idx, batch in enumerate(dataloader):
+        for batch_idx, batch in val_pbar:
             # ==================== 数据准备 ====================
             images = batch['image'].to(device, non_blocking=True)
             masks = batch['mask'].to(device, non_blocking=True)
@@ -432,12 +539,18 @@ def validate(model, dataloader, loss_fn, device, args):
                 dice_scores.append(0.0)
                 hausdorff_distances.append(float('inf'))
             
-            # 可选：打印验证进度
-            if batch_idx % (num_batches // 5 + 1) == 0:
-                progress = 100.0 * batch_idx / num_batches
-                current_dice = dice_scores[-1] if dice_scores else 0.0
-                print(f'验证进度: {progress:.1f}% ({batch_idx}/{num_batches}), '
-                      f'当前Dice: {current_dice:.4f}')
+            # 更新验证进度条
+            current_dice = dice_scores[-1] if dice_scores else 0.0
+            current_hausdorff = hausdorff_distances[-1] if hausdorff_distances else float('inf')
+            
+            val_pbar.set_postfix({
+                'Loss': f'{loss.item():.4f}',
+                'Dice': f'{current_dice:.4f}',
+                'HD': f'{current_hausdorff:.2f}' if current_hausdorff != float('inf') else 'inf'
+            })
+    
+    # 关闭验证进度条
+    val_pbar.close()
     
     # ==================== 统计结果 ====================
     # 计算平均验证损失
@@ -487,10 +600,29 @@ def save_checkpoint(model, optimizer, epoch, best_dice, args, filename):
 def main():
     args = parse_args()
     
+    print("="*100)
+    print("3D U-Net BraTS2021 训练开始")
+    print("="*100)
+    
+    # 打印训练配置
+    print("训练配置:")
+    print(f"  数据目录: {args.data_dir}")
+    print(f"  输出目录: {args.output_dir}")
+    print(f"  批次大小: {args.batch_size}")
+    print(f"  训练轮数: {args.epochs}")
+    print(f"  学习率: {args.lr}")
+    print(f"  目标形状: {args.target_shape}")
+    print(f"  混合精度: {'启用' if args.amp else '禁用'}")
+    print(f"  深度监督: {'启用' if args.deep_supervision else '禁用'}")
+    print(f"  残差连接: {'启用' if args.residual else '禁用'}")
+    print(f"  工作进程: {args.num_workers}")
+    print("-"*50)
+    
     # 创建输出目录
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(os.path.join(args.output_dir, 'checkpoints'), exist_ok=True)
     os.makedirs(os.path.join(args.output_dir, 'visualizations'), exist_ok=True)
+    print(f"输出目录已创建: {args.output_dir}")
     
     # 设置分布式训练
     setup_distributed(args)
@@ -501,10 +633,20 @@ def main():
             device = torch.device(f'cuda:{args.local_rank}')
         else:
             device = torch.device('cuda')
+        
+        # 打印GPU信息
+        print(f"使用设备: {device}")
+        print(f"GPU名称: {torch.cuda.get_device_name(device)}")
+        print(f"GPU内存: {torch.cuda.get_device_properties(device).total_memory / 1024**3:.1f} GB")
+        print(f"CUDA版本: {torch.version.cuda}")
+        print(f"PyTorch版本: {torch.__version__}")
     else:
         device = torch.device('cpu')
+        print("使用设备: CPU")
+    print("-"*50)
     
     # 获取数据加载器
+    print("正在加载数据...")
     train_loader, val_loader, test_loader = get_data_loaders(
         data_dir=args.data_dir,
         batch_size=args.batch_size,
@@ -512,8 +654,29 @@ def main():
         target_shape=args.target_shape
     )
     
+    print("数据加载完成:")
+    print(f"  训练集: {len(train_loader.dataset)} 个样本, {len(train_loader)} 个批次")
+    print(f"  验证集: {len(val_loader.dataset)} 个样本, {len(val_loader)} 个批次")
+    print(f"  测试集: {len(test_loader.dataset)} 个样本, {len(test_loader)} 个批次")
+    print("-"*50)
+    
     # 创建模型
+    print("正在创建模型...")
     model = get_model(args).to(device)
+    
+    # 计算模型参数数量
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    print("模型信息:")
+    print(f"  模型类型: 3D U-Net")
+    print(f"  输入通道: {args.in_channels}")
+    print(f"  输出通道: {args.out_channels}")
+    print(f"  特征层级: {args.features}")
+    print(f"  总参数量: {total_params:,}")
+    print(f"  可训练参数: {trainable_params:,}")
+    print(f"  模型大小: {total_params * 4 / 1024**2:.1f} MB (FP32)")
+    print("-"*50)
     
     # 分布式训练设置
     if args.distributed:
@@ -541,10 +704,19 @@ def main():
     best_dice = 0
     patience_counter = 0
     
-    for epoch in range(args.epochs):
+    # 创建总体训练进度条
+    epoch_pbar = tqdm(
+        range(args.epochs),
+        desc="总体训练进度",
+        unit="epoch",
+        ncols=120,
+        position=0
+    )
+    
+    for epoch in epoch_pbar:
         # 训练一个epoch
         train_loss = train_epoch(
-            model, train_loader, optimizer, loss_fn, device, scaler, args.amp
+            model, train_loader, optimizer, loss_fn, device, scaler, args.amp, epoch
         )
         
         # 验证
@@ -553,13 +725,39 @@ def main():
         # 更新学习率
         scheduler.step(val_dice)
         
+        # 更新总体进度条
+        epoch_pbar.set_postfix({
+            'TrainLoss': f'{train_loss:.4f}',
+            'ValLoss': f'{val_loss:.4f}',
+            'ValDice': f'{val_dice:.4f}',
+            'BestDice': f'{best_dice:.4f}',
+            'Patience': f'{patience_counter}/{args.patience}',
+            'LR': f'{optimizer.param_groups[0]["lr"]:.1e}'
+        })
+        
         # 记录指标
         if args.rank == 0:
-            print(f'Epoch {epoch+1}/{args.epochs}, '
-                  f'Train Loss: {train_loss:.4f}, '
-                  f'Val Loss: {val_loss:.4f}, '
-                  f'Val Dice: {val_dice:.4f}, '
-                  f'Val Hausdorff: {val_hausdorff:.4f}')
+            # 使用tqdm.write来避免与进度条冲突
+            tqdm.write(f"\n{'*'*80}")
+            tqdm.write(f"EPOCH {epoch+1}/{args.epochs} 总结")
+            tqdm.write(f"{'*'*80}")
+            tqdm.write(f"训练损失:     {train_loss:.6f}")
+            tqdm.write(f"验证损失:     {val_loss:.6f}")
+            tqdm.write(f"验证Dice系数: {val_dice:.6f}")
+            tqdm.write(f"验证Hausdorff: {val_hausdorff:.4f}")
+            tqdm.write(f"当前学习率:   {optimizer.param_groups[0]['lr']:.2e}")
+            tqdm.write(f"最佳Dice:     {best_dice:.6f}")
+            tqdm.write(f"早停计数:     {patience_counter}/{args.patience}")
+            
+            # 性能趋势分析
+            if epoch > 0:
+                tqdm.write(f"\n性能变化:")
+                if val_dice > best_dice:
+                    tqdm.write(f"  ✓ Dice系数提升: {val_dice - best_dice:+.6f}")
+                else:
+                    tqdm.write(f"  ✗ Dice系数下降: {val_dice - best_dice:+.6f}")
+            
+            tqdm.write(f"{'*'*80}\n")
             
             writer.add_scalar('Loss/train', train_loss, epoch)
             writer.add_scalar('Loss/val', val_loss, epoch)
@@ -596,7 +794,7 @@ def main():
                     model, optimizer, epoch, best_dice, args,
                     os.path.join(args.output_dir, 'checkpoints', 'best_model.pth')
                 )
-                print(f'New best model saved with Dice: {best_dice:.4f}')
+                tqdm.write(f'✓ 新的最佳模型已保存，Dice: {best_dice:.4f}')
         else:
             patience_counter += 1
         
@@ -609,16 +807,19 @@ def main():
         
         # 早停
         if patience_counter >= args.patience:
-            print(f'Early stopping at epoch {epoch+1}')
+            tqdm.write(f'⚠ 早停触发，在第 {epoch+1} 轮停止训练')
             break
     
-    # 关闭TensorBoard写入器
+    # 关闭进度条和TensorBoard写入器
+    epoch_pbar.close()
     if args.rank == 0:
         writer.close()
     
     # 在测试集上评估最佳模型
     if args.rank == 0:
-        print('Evaluating best model on test set...')
+        print('\n' + '='*60)
+        print('正在评估最佳模型...')
+        print('='*60)
         
         # 加载最佳模型
         checkpoint = torch.load(os.path.join(args.output_dir, 'checkpoints', 'best_model.pth'))
@@ -631,9 +832,15 @@ def main():
         # 在测试集上评估
         test_loss, test_dice, test_hausdorff = validate(model, test_loader, loss_fn, device, args)
         
-        print(f'Test Loss: {test_loss:.4f}, '
-              f'Test Dice: {test_dice:.4f}, '
-              f'Test Hausdorff: {test_hausdorff:.4f}')
+        print('\n' + '='*60)
+        print('最终测试结果:')
+        print('='*60)
+        print(f'测试损失:      {test_loss:.6f}')
+        print(f'测试Dice系数:  {test_dice:.6f}')
+        print(f'测试Hausdorff: {test_hausdorff:.4f}')
+        print('='*60)
+        print('训练完成! 🎉')
+        print('='*60)
 
 
 if __name__ == '__main__':
