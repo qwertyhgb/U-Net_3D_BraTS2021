@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.cuda.amp import GradScaler, autocast  # 用于混合精度训练
+from torch.amp import GradScaler, autocast  # 用于混合精度训练
 import torch.distributed as dist  # 分布式训练
 from torch.nn.parallel import DistributedDataParallel as DDP  # 分布式数据并行
 from torch.utils.data.distributed import DistributedSampler  # 分布式采样器
@@ -272,7 +272,7 @@ def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler=None, use_
         # ==================== 前向传播 ====================
         if use_amp:
             # 混合精度训练路径
-            with autocast():
+            with autocast('cuda'):
                 # 模型前向传播
                 outputs = model(images)
                 
@@ -527,7 +527,7 @@ def main():
     loss_fn = get_loss_function()
     
     # 创建混合精度训练的缩放器
-    scaler = GradScaler('cuda') if args.amp else None
+    scaler = GradScaler() if args.amp else None
     
     # 创建TensorBoard写入器
     if args.rank == 0:
