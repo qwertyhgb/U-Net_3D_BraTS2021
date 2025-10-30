@@ -4,6 +4,7 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.amp import GradScaler, autocast  # 用于混合精度训练
 import torch.distributed as dist  # 分布式训练
@@ -61,21 +62,82 @@ def parse_args():
     parser.add_argument('--target_shape', type=int, nargs='+', default=[128, 128, 128],
                         help='目标体积形状，用于重采样MRI体积')
     
+    # 优化器参数
+    parser.add_argument('--optimizer', type=str, default='adam', choices=['adam', 'adamw', 'sgd'],
+                        help='优化器选择：adam, adamw, sgd')
+    parser.add_argument('--momentum', type=float, default=0.9,
+                        help='SGD优化器的动量参数')
+    parser.add_argument('--beta1', type=float, default=0.9,
+                        help='Adam优化器的beta1参数')
+    parser.add_argument('--beta2', type=float, default=0.999,
+                        help='Adam优化器的beta2参数')
+    
+    # 学习率调度器参数
+    parser.add_argument('--scheduler', type=str, default='plateau', 
+                        choices=['plateau', 'cosine', 'step', 'exponential'],
+                        help='学习率调度器类型')
+    parser.add_argument('--lr_factor', type=float, default=0.5,
+                        help='学习率衰减因子')
+    parser.add_argument('--lr_patience', type=int, default=5,
+                        help='学习率调度器的耐心值')
+    parser.add_argument('--min_lr', type=float, default=1e-7,
+                        help='最小学习率')
+    
+    # 损失函数参数
+    parser.add_argument('--loss_weights', type=float, nargs='+', default=[1.0, 1.0],
+                        help='损失函数权重：[交叉熵权重, Dice权重]')
+    parser.add_argument('--focal_loss', action='store_true',
+                        help='是否使用Focal Loss处理类别不平衡')
+    parser.add_argument('--focal_alpha', type=float, default=0.25,
+                        help='Focal Loss的alpha参数')
+    parser.add_argument('--focal_gamma', type=float, default=2.0,
+                        help='Focal Loss的gamma参数')
+    
+    # 数据增强参数
+    parser.add_argument('--augmentation_prob', type=float, default=0.5,
+                        help='数据增强的应用概率')
+    parser.add_argument('--rotation_angle', type=float, default=15,
+                        help='随机旋转的最大角度')
+    parser.add_argument('--elastic_alpha', type=float, default=15,
+                        help='弹性变形的强度参数')
+    
     # 分布式训练参数
     parser.add_argument('--distributed', action='store_true',
                         help='是否使用分布式训练，多GPU训练')
     parser.add_argument('--local_rank', type=int, default=-1,
                         help='分布式训练的本地排名，由torch.distributed.launch设置')
-    parser.add_argument('--num_workers', type=int, default=0,
+    parser.add_argument('--num_workers', type=int, default=2,
                         help='数据加载器的工作进程数，用于并行数据加载')
     
     # 混合精度训练
     parser.add_argument('--amp', action='store_true', default=True,
                         help='是否使用混合精度训练，可加速训练并减少内存使用')
     
-    # 可视化参数
+    # 梯度相关参数
+    parser.add_argument('--gradient_clipping', type=float, default=1.0,
+                        help='梯度裁剪的最大范数，0表示不使用梯度裁剪')
+    parser.add_argument('--accumulation_steps', type=int, default=1,
+                        help='梯度累积步数，用于模拟更大的批次大小')
+    
+    # 可视化和日志参数
     parser.add_argument('--vis_freq', type=int, default=10,
                         help='可视化频率（每n个epoch保存一次可视化结果）')
+    parser.add_argument('--log_freq', type=int, default=10,
+                        help='日志记录频率（每n个batch记录一次详细信息）')
+    parser.add_argument('--save_freq', type=int, default=10,
+                        help='模型保存频率（每n个epoch保存一次检查点）')
+    
+    # 恢复训练参数
+    parser.add_argument('--resume', type=str, default=None,
+                        help='恢复训练的检查点路径')
+    parser.add_argument('--pretrained', type=str, default=None,
+                        help='预训练模型路径')
+    
+    # 验证和测试参数
+    parser.add_argument('--val_freq', type=int, default=1,
+                        help='验证频率（每n个epoch进行一次验证）')
+    parser.add_argument('--test_only', action='store_true',
+                        help='仅进行测试，不训练')
     
     return parser.parse_args()
 
@@ -124,152 +186,361 @@ def get_model(args):
     return model
 
 
-def get_loss_function():
-    """构建组合损失函数
+def get_optimizer(model, args):
+    """创建优化器
     
-    医学图像分割任务中，单一损失函数往往无法很好地处理类别不平衡和边界精确性问题。
-    本函数构建了一个组合损失函数，结合了交叉熵损失和Dice损失的优势：
+    根据参数配置创建不同类型的优化器，支持Adam、AdamW、SGD等
     
-    1. 交叉熵损失（Cross-Entropy Loss）：
-       - 优势：训练稳定，收敛快，对类别不平衡有一定鲁棒性
-       - 劣势：主要关注像素级分类，对分割区域的整体性考虑不足
-    
-    2. Dice损失（Dice Loss）：
-       - 优势：直接优化Dice系数，关注分割区域的重叠度，对小目标友好
-       - 劣势：训练初期可能不稳定，梯度可能较小
-    
-    组合策略：Loss = CrossEntropy + Dice，平衡像素级准确性和区域级完整性
-    
+    参数:
+        model: 要优化的模型
+        args: 命令行参数
+        
     返回:
-        function: 组合损失函数，接受预测和真实标签，返回损失值
+        optimizer: 配置好的优化器
+    """
+    if args.optimizer.lower() == 'adam':
+        optimizer = optim.Adam(
+            model.parameters(),
+            lr=args.lr,
+            betas=(args.beta1, args.beta2),
+            weight_decay=args.weight_decay,
+            eps=1e-8
+        )
+        print(f"使用Adam优化器，lr={args.lr}, betas=({args.beta1}, {args.beta2}), weight_decay={args.weight_decay}")
+        
+    elif args.optimizer.lower() == 'adamw':
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=args.lr,
+            betas=(args.beta1, args.beta2),
+            weight_decay=args.weight_decay,
+            eps=1e-8
+        )
+        print(f"使用AdamW优化器，lr={args.lr}, betas=({args.beta1}, {args.beta2}), weight_decay={args.weight_decay}")
+        
+    elif args.optimizer.lower() == 'sgd':
+        optimizer = optim.SGD(
+            model.parameters(),
+            lr=args.lr,
+            momentum=args.momentum,
+            weight_decay=args.weight_decay,
+            nesterov=True
+        )
+        print(f"使用SGD优化器，lr={args.lr}, momentum={args.momentum}, weight_decay={args.weight_decay}")
+        
+    else:
+        raise ValueError(f"不支持的优化器类型: {args.optimizer}")
+    
+    return optimizer
+
+
+def get_scheduler(optimizer, args):
+    """创建学习率调度器
+    
+    根据参数配置创建不同类型的学习率调度器
+    
+    参数:
+        optimizer: 优化器
+        args: 命令行参数
+        
+    返回:
+        scheduler: 配置好的学习率调度器
+    """
+    if args.scheduler.lower() == 'plateau':
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode='max',  # 监控指标越大越好（如Dice系数）
+            factor=args.lr_factor,
+            patience=args.lr_patience,
+            min_lr=args.min_lr,
+            verbose=True
+        )
+        print(f"使用ReduceLROnPlateau调度器，factor={args.lr_factor}, patience={args.lr_patience}")
+        
+    elif args.scheduler.lower() == 'cosine':
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=args.epochs,
+            eta_min=args.min_lr
+        )
+        print(f"使用CosineAnnealingLR调度器，T_max={args.epochs}, eta_min={args.min_lr}")
+        
+    elif args.scheduler.lower() == 'step':
+        scheduler = optim.lr_scheduler.StepLR(
+            optimizer,
+            step_size=args.lr_patience * 2,  # 每隔patience*2个epoch衰减一次
+            gamma=args.lr_factor
+        )
+        print(f"使用StepLR调度器，step_size={args.lr_patience * 2}, gamma={args.lr_factor}")
+        
+    elif args.scheduler.lower() == 'exponential':
+        scheduler = optim.lr_scheduler.ExponentialLR(
+            optimizer,
+            gamma=args.lr_factor
+        )
+        print(f"使用ExponentialLR调度器，gamma={args.lr_factor}")
+        
+    else:
+        raise ValueError(f"不支持的调度器类型: {args.scheduler}")
+    
+    return scheduler
+
+
+class FocalLoss(nn.Module):
+    """Focal Loss实现
+    
+    Focal Loss专门设计用于处理类别不平衡问题，通过降低易分类样本的权重，
+    让模型更专注于困难样本的学习。
+    
+    公式：FL(p_t) = -α_t * (1-p_t)^γ * log(p_t)
+    其中：
+    - p_t: 正确类别的预测概率
+    - α_t: 类别权重因子
+    - γ: 聚焦参数，控制困难样本的权重
+    """
+    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+        
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = self.alpha * (1-pt)**self.gamma * ce_loss
+        
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
+
+def get_loss_function(args):
+    """构建优化的组合损失函数
+    
+    根据参数配置构建损失函数，支持多种损失类型的组合：
+    1. 交叉熵损失 / Focal Loss
+    2. Dice损失
+    3. 可配置的权重平衡
+    
+    参数:
+        args: 命令行参数，包含损失函数配置
+        
+    返回:
+        function: 组合损失函数
     """
     
     def dice_loss(y_pred, y_true, smooth=1e-6):
-        """计算单个类别的Dice损失
+        """改进的Dice损失计算
         
-        Dice损失 = 1 - Dice系数
-        Dice系数 = 2 * |预测∩真实| / (|预测| + |真实|)
-        
-        参数:
-            y_pred (Tensor): 预测概率，形状为 [N]，值范围 [0,1]
-            y_true (Tensor): 真实标签，形状为 [N]，值为 0 或 1
-            smooth (float): 平滑项，防止分母为0，提高数值稳定性
-            
-        返回:
-            Tensor: Dice损失值
+        使用更稳定的数值计算方式，避免梯度消失问题
         """
-        # 展平张量，便于计算
+        # 展平张量
         y_pred = y_pred.contiguous().view(-1)
         y_true = y_true.contiguous().view(-1)
         
-        # 计算交集：预测为正且真实为正的像素数
+        # 计算交集和并集
         intersection = (y_pred * y_true).sum()
+        union = y_pred.sum() + y_true.sum()
         
-        # 计算Dice系数，然后转换为损失（1 - Dice）
-        dice_coeff = (2. * intersection + smooth) / (y_pred.sum() + y_true.sum() + smooth)
-        dice_loss_value = 1 - dice_coeff
+        # 使用改进的Dice计算公式，提高数值稳定性
+        dice_coeff = (2. * intersection + smooth) / (union + smooth)
         
-        return dice_loss_value
+        return 1 - dice_coeff
+    
+    def tversky_loss(y_pred, y_true, alpha=0.3, beta=0.7, smooth=1e-6):
+        """Tversky损失函数
+        
+        Tversky损失是Dice损失的泛化，通过α和β参数可以调节
+        对假阳性和假阴性的敏感度，特别适合处理类别不平衡问题
+        """
+        y_pred = y_pred.contiguous().view(-1)
+        y_true = y_true.contiguous().view(-1)
+        
+        # True Positives, False Positives & False Negatives
+        TP = (y_pred * y_true).sum()
+        FP = ((1-y_true) * y_pred).sum()
+        FN = (y_true * (1-y_pred)).sum()
+        
+        tversky_coeff = (TP + smooth) / (TP + alpha*FP + beta*FN + smooth)
+        
+        return 1 - tversky_coeff
+    
+    # 根据配置选择基础损失函数
+    if args.focal_loss:
+        base_loss_fn = FocalLoss(alpha=args.focal_alpha, gamma=args.focal_gamma)
+        print(f"使用Focal Loss，alpha={args.focal_alpha}, gamma={args.focal_gamma}")
+    else:
+        base_loss_fn = nn.CrossEntropyLoss()
+        print("使用标准交叉熵损失")
+    
+    # 获取损失权重
+    ce_weight, dice_weight = args.loss_weights
+    print(f"损失权重配置：交叉熵={ce_weight}, Dice={dice_weight}")
     
     def combined_loss(y_pred, y_true):
-        """组合损失函数：交叉熵 + Dice损失
+        """优化的组合损失函数
         
         参数:
             y_pred (Tensor): 模型预测logits，形状为 [B, C, D, H, W]
             y_true (Tensor): 真实分割标签，形状为 [B, D, H, W]
             
         返回:
-            Tensor: 组合损失值
+            dict: 包含各项损失的字典
         """
-        # ==================== 交叉熵损失 ====================
-        # 处理类别不平衡，可以考虑加权交叉熵
-        # 这里使用标准交叉熵，对所有类别等权重处理
-        ce_loss = nn.CrossEntropyLoss()(y_pred, y_true)
+        # ==================== 基础损失计算 ====================
+        base_loss = base_loss_fn(y_pred, y_true)
         
-        # ==================== Dice损失 ====================
+        # ==================== Dice/Tversky损失计算 ====================
         # 将预测logits转换为概率分布
-        y_pred_softmax = torch.softmax(y_pred, dim=1)  # [B, C, D, H, W]
+        y_pred_softmax = torch.softmax(y_pred, dim=1)
         
         # 将真实标签转换为one-hot编码
         num_classes = y_pred.shape[1]
         y_true_one_hot = torch.zeros_like(y_pred_softmax)
         y_true_one_hot = y_true_one_hot.scatter_(1, y_true.unsqueeze(1), 1)
         
-        # 计算每个前景类别的Dice损失（跳过背景类别）
-        dice_loss_total = 0
-        num_foreground_classes = 0
-        
-        for class_idx in range(1, num_classes):  # 从1开始，跳过背景类别（索引0）
-            # 提取当前类别的预测概率和真实标签
-            pred_class = y_pred_softmax[:, class_idx]  # [B, D, H, W]
-            true_class = y_true_one_hot[:, class_idx]  # [B, D, H, W]
+        # 计算每个前景类别的Dice损失
+        dice_losses = []
+        for class_idx in range(1, num_classes):  # 跳过背景类别
+            pred_class = y_pred_softmax[:, class_idx]
+            true_class = y_true_one_hot[:, class_idx]
             
-            # 只有当真实标签中存在该类别时才计算损失
+            # 只有当该类别存在时才计算损失
             if true_class.sum() > 0:
-                dice_loss_total += dice_loss(pred_class, true_class)
-                num_foreground_classes += 1
+                class_dice_loss = dice_loss(pred_class, true_class)
+                dice_losses.append(class_dice_loss)
         
         # 计算平均Dice损失
-        if num_foreground_classes > 0:
-            avg_dice_loss = dice_loss_total / num_foreground_classes
+        if dice_losses:
+            avg_dice_loss = torch.stack(dice_losses).mean()
         else:
-            # 如果没有前景类别，Dice损失为0
             avg_dice_loss = torch.tensor(0.0, device=y_pred.device, requires_grad=True)
         
         # ==================== 组合损失 ====================
-        # 将交叉熵损失和Dice损失相加
-        # 可以考虑添加权重系数来平衡两种损失的贡献
-        total_loss = ce_loss + avg_dice_loss
+        total_loss = ce_weight * base_loss + dice_weight * avg_dice_loss
         
-        return total_loss
+        # 返回详细的损失信息用于监控
+        return {
+            'total_loss': total_loss,
+            'base_loss': base_loss,
+            'dice_loss': avg_dice_loss,
+            'ce_weight': ce_weight,
+            'dice_weight': dice_weight
+        }
     
     return combined_loss
 
 
-def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler=None, use_amp=False, epoch_num=0):
+def compute_loss_with_deep_supervision(outputs, masks, loss_fn, batch_idx):
+    """计算包含深度监督的损失
+    
+    参数:
+        outputs: 模型输出，可能是单个输出或包含深度监督的元组
+        masks: 真实标签
+        loss_fn: 损失函数
+        batch_idx: 当前批次索引
+        
+    返回:
+        dict: 包含各项损失的字典
+    """
+    if isinstance(outputs, tuple):
+        # 深度监督模式：outputs = (主输出, 辅助输出1, 辅助输出2, ...)
+        main_output = outputs[0]
+        auxiliary_outputs = outputs[1:]
+        
+        # 计算主输出的损失
+        main_loss_dict = loss_fn(main_output, masks)
+        total_loss = main_loss_dict['total_loss']
+        
+        # 添加辅助输出的损失，权重递减
+        aux_losses = []
+        for i, aux_output in enumerate(auxiliary_outputs):
+            # 权重系数：0.5, 0.25, 0.125, ...
+            weight = 0.5 ** (i + 1)
+            aux_loss_dict = loss_fn(aux_output, masks)
+            aux_loss = aux_loss_dict['total_loss']
+            total_loss += weight * aux_loss
+            aux_losses.append(aux_loss.item())
+            
+        if batch_idx < 3:
+            print(f"批次 {batch_idx + 1} - 深度监督: 主损失={main_loss_dict['total_loss']:.4f}, "
+                  f"辅助损失={aux_losses}, 辅助输出数={len(auxiliary_outputs)}")
+        
+        return {
+            'total_loss': total_loss,
+            'main_loss': main_loss_dict['total_loss'],
+            'aux_losses': aux_losses,
+            'base_loss': main_loss_dict['base_loss'],
+            'dice_loss': main_loss_dict['dice_loss']
+        }
+    else:
+        # 标准模式：只有主输出
+        loss_dict = loss_fn(outputs, masks)
+        return loss_dict
+
+
+def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler=None, use_amp=False, epoch_num=0, args=None):
     """执行一个训练周期
     
     在一个epoch中遍历所有训练数据，执行前向传播、损失计算、反向传播和参数更新。
-    支持混合精度训练和深度监督机制。
+    支持混合精度训练、深度监督机制、梯度累积和梯度裁剪。
     
     训练流程：
     1. 设置模型为训练模式
     2. 遍历数据批次
     3. 前向传播计算预测结果
     4. 计算损失（包括深度监督损失）
-    5. 反向传播计算梯度
-    6. 更新模型参数
-    7. 累计损失统计
+    5. 反向传播计算梯度（支持梯度累积）
+    6. 梯度裁剪（可选）
+    7. 更新模型参数
+    8. 累计损失统计和性能监控
     
     参数:
         model (nn.Module): 要训练的3D U-Net模型
         dataloader (DataLoader): 训练数据加载器
-        optimizer (Optimizer): 优化器（如Adam）
+        optimizer (Optimizer): 优化器
         loss_fn (function): 损失函数
         device (torch.device): 计算设备（CPU或GPU）
         scaler (GradScaler, 可选): 混合精度训练的梯度缩放器
         use_amp (bool): 是否使用自动混合精度训练
         epoch_num (int): 当前epoch编号
+        args: 命令行参数，包含训练配置
         
     返回:
-        float: 当前epoch的平均训练损失
+        dict: 包含训练统计信息的字典
     """
     # 设置模型为训练模式，启用dropout和batch normalization的训练行为
     model.train()
     
     # 初始化统计变量
-    epoch_loss = 0.0
-    num_batches = len(dataloader)
-    batch_times = []
-    data_load_times = []
-    forward_times = []
-    backward_times = []
+    epoch_stats = {
+        'total_loss': 0.0,
+        'base_loss': 0.0,
+        'dice_loss': 0.0,
+        'num_batches': len(dataloader),
+        'batch_times': [],
+        'data_load_times': [],
+        'forward_times': [],
+        'backward_times': [],
+        'gpu_memory_usage': []
+    }
+    
+    # 梯度累积相关变量
+    accumulation_steps = getattr(args, 'accumulation_steps', 1)
+    effective_batch_size = args.batch_size * accumulation_steps
     
     print(f"\n{'='*60}")
     print(f"开始训练 Epoch {epoch_num + 1}")
-    print(f"总批次数: {num_batches}")
+    print(f"总批次数: {epoch_stats['num_batches']}")
     print(f"使用设备: {device}")
     print(f"混合精度训练: {'启用' if use_amp else '禁用'}")
+    print(f"梯度累积步数: {accumulation_steps}")
+    print(f"有效批次大小: {effective_batch_size}")
+    if hasattr(args, 'gradient_clipping') and args.gradient_clipping > 0:
+        print(f"梯度裁剪: {args.gradient_clipping}")
     print(f"{'='*60}")
     
     epoch_start_time = time.time()
@@ -277,10 +548,10 @@ def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler=None, use_
     # 创建训练进度条
     train_pbar = tqdm(
         enumerate(dataloader), 
-        total=num_batches,
-        desc=f"Epoch {epoch_num + 1}/{epoch_num + 1} - 训练",
+        total=epoch_stats['num_batches'],
+        desc=f"Epoch {epoch_num + 1} - 训练",
         unit="batch",
-        ncols=120,
+        ncols=140,
         leave=False
     )
     
@@ -294,15 +565,16 @@ def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler=None, use_
         images = batch['image'].to(device, non_blocking=True)  # [B, 4, D, H, W]
         masks = batch['mask'].to(device, non_blocking=True)    # [B, D, H, W]
         data_load_time = time.time() - data_start_time
-        data_load_times.append(data_load_time)
+        epoch_stats['data_load_times'].append(data_load_time)
         
         # 打印数据形状信息（前几个批次）
         if batch_idx < 3:
             print(f"批次 {batch_idx + 1} - 数据形状: images={list(images.shape)}, masks={list(masks.shape)}")
             print(f"批次 {batch_idx + 1} - 数据加载时间: {data_load_time:.3f}s")
         
-        # 清零梯度，防止梯度累积
-        optimizer.zero_grad()
+        # 梯度累积：只在累积步数的开始清零梯度
+        if batch_idx % accumulation_steps == 0:
+            optimizer.zero_grad()
         
         # ==================== 前向传播 ====================
         forward_start_time = time.time()
@@ -313,30 +585,15 @@ def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler=None, use_
                 # 模型前向传播
                 outputs = model(images)
                 
-                # 处理深度监督输出
-                if isinstance(outputs, tuple):
-                    # 深度监督模式：outputs = (主输出, 辅助输出1, 辅助输出2, ...)
-                    main_output = outputs[0]
-                    auxiliary_outputs = outputs[1:]
-                    
-                    # 计算主输出的损失
-                    loss = loss_fn(main_output, masks)
-                    
-                    # 添加辅助输出的损失，权重递减
-                    for i, aux_output in enumerate(auxiliary_outputs):
-                        # 权重系数：0.5, 0.25, 0.125, ...
-                        weight = 0.5 ** (i + 1)
-                        aux_loss = loss_fn(aux_output, masks)
-                        loss += weight * aux_loss
-                        
-                    if batch_idx < 3:
-                        print(f"批次 {batch_idx + 1} - 深度监督: 主损失={loss_fn(main_output, masks):.4f}, 辅助输出数={len(auxiliary_outputs)}")
-                else:
-                    # 标准模式：只有主输出
-                    loss = loss_fn(outputs, masks)
+                # 处理深度监督输出并计算损失
+                loss_dict = compute_loss_with_deep_supervision(outputs, masks, loss_fn, batch_idx)
+                loss = loss_dict['total_loss']
+                
+                # 梯度累积：按累积步数缩放损失
+                loss = loss / accumulation_steps
             
             forward_time = time.time() - forward_start_time
-            forward_times.append(forward_time)
+            epoch_stats['forward_times'].append(forward_time)
             
             # ==================== 反向传播（混合精度）====================
             backward_start_time = time.time()
@@ -344,93 +601,105 @@ def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler=None, use_
             # 缩放损失以防止梯度下溢
             scaler.scale(loss).backward()
             
-            # 更新参数
-            scaler.step(optimizer)
-            
-            # 更新缩放因子
-            scaler.update()
+            # 梯度累积：只在累积步数结束时更新参数
+            if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == epoch_stats['num_batches']:
+                # 梯度裁剪
+                if hasattr(args, 'gradient_clipping') and args.gradient_clipping > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.gradient_clipping)
+                
+                # 更新参数
+                scaler.step(optimizer)
+                scaler.update()
             
             backward_time = time.time() - backward_start_time
-            backward_times.append(backward_time)
+            epoch_stats['backward_times'].append(backward_time)
             
         else:
             # ==================== 标准精度训练路径 ====================
             # 模型前向传播
             outputs = model(images)
             
-            # 处理深度监督输出
-            if isinstance(outputs, tuple):
-                # 深度监督模式
-                main_output = outputs[0]
-                auxiliary_outputs = outputs[1:]
-                
-                # 计算主输出的损失
-                loss = loss_fn(main_output, masks)
-                
-                # 添加辅助输出的损失，权重递减
-                for i, aux_output in enumerate(auxiliary_outputs):
-                    weight = 0.5 ** (i + 1)
-                    aux_loss = loss_fn(aux_output, masks)
-                    loss += weight * aux_loss
-                    
-                if batch_idx < 3:
-                    print(f"批次 {batch_idx + 1} - 深度监督: 主损失={loss_fn(main_output, masks):.4f}, 辅助输出数={len(auxiliary_outputs)}")
-            else:
-                # 标准模式
-                loss = loss_fn(outputs, masks)
+            # 处理深度监督输出并计算损失
+            loss_dict = compute_loss_with_deep_supervision(outputs, masks, loss_fn, batch_idx)
+            loss = loss_dict['total_loss']
+            
+            # 梯度累积：按累积步数缩放损失
+            loss = loss / accumulation_steps
             
             forward_time = time.time() - forward_start_time
-            forward_times.append(forward_time)
+            epoch_stats['forward_times'].append(forward_time)
             
             # ==================== 反向传播（标准精度）====================
             backward_start_time = time.time()
             
             loss.backward()
             
-            # 可选：梯度裁剪，防止梯度爆炸
-            # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
-            # 更新参数
-            optimizer.step()
+            # 梯度累积：只在累积步数结束时更新参数
+            if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == epoch_stats['num_batches']:
+                # 梯度裁剪
+                if hasattr(args, 'gradient_clipping') and args.gradient_clipping > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.gradient_clipping)
+                
+                # 更新参数
+                optimizer.step()
             
             backward_time = time.time() - backward_start_time
-            backward_times.append(backward_time)
+            epoch_stats['backward_times'].append(backward_time)
         
         # ==================== 损失统计和进度显示 ====================
-        # 累计当前批次的损失
-        epoch_loss += loss.item()
-        batch_time = time.time() - batch_start_time
-        batch_times.append(batch_time)
+        # 累计当前批次的损失（注意：这里的loss已经被累积步数缩放过）
+        actual_loss = loss.item() * accumulation_steps  # 恢复真实损失值用于统计
+        epoch_stats['total_loss'] += actual_loss
         
-        # 更新进度条
-        avg_batch_time = sum(batch_times) / len(batch_times)
-        current_loss = epoch_loss / (batch_idx + 1)
+        # 累计详细损失信息
+        if 'base_loss' in loss_dict:
+            epoch_stats['base_loss'] += loss_dict['base_loss'].item()
+        if 'dice_loss' in loss_dict:
+            epoch_stats['dice_loss'] += loss_dict['dice_loss'].item()
+        
+        batch_time = time.time() - batch_start_time
+        epoch_stats['batch_times'].append(batch_time)
         
         # GPU内存使用情况
         if torch.cuda.is_available():
             gpu_memory = torch.cuda.memory_allocated(device) / 1024**3  # GB
+            epoch_stats['gpu_memory_usage'].append(gpu_memory)
             memory_info = f"GPU:{gpu_memory:.1f}GB"
         else:
             memory_info = "CPU"
         
+        # 更新进度条
+        avg_batch_time = sum(epoch_stats['batch_times']) / len(epoch_stats['batch_times'])
+        current_avg_loss = epoch_stats['total_loss'] / (batch_idx + 1)
+        
         # 更新进度条描述
         train_pbar.set_postfix({
-            'Loss': f'{loss.item():.4f}',
-            'AvgLoss': f'{current_loss:.4f}',
+            'Loss': f'{actual_loss:.4f}',
+            'AvgLoss': f'{current_avg_loss:.4f}',
             'Time': f'{batch_time:.2f}s',
             'Memory': memory_info,
-            'LR': f'{optimizer.param_groups[0]["lr"]:.1e}'
+            'LR': f'{optimizer.param_groups[0]["lr"]:.1e}',
+            'Accum': f'{(batch_idx % accumulation_steps) + 1}/{accumulation_steps}'
         })
         
         # 详细信息输出（前几个批次和关键节点）
-        if batch_idx < 3 or batch_idx % max(1, num_batches // 10) == 0:
-            eta_seconds = avg_batch_time * (num_batches - batch_idx - 1)
+        log_freq = getattr(args, 'log_freq', 10)
+        if batch_idx < 3 or batch_idx % max(1, epoch_stats['num_batches'] // log_freq) == 0:
+            eta_seconds = avg_batch_time * (epoch_stats['num_batches'] - batch_idx - 1)
             eta_minutes = eta_seconds / 60
             
-            tqdm.write(f"[详细] 批次 {batch_idx+1}: 损失={loss.item():.6f}, "
-                      f"数据加载={data_load_times[-1]:.3f}s, "
-                      f"前向={forward_times[-1]:.3f}s, "
-                      f"反向={backward_times[-1]:.3f}s, "
+            # 构建详细的损失信息
+            loss_info = f"总损失={actual_loss:.6f}"
+            if 'base_loss' in loss_dict:
+                loss_info += f", 基础损失={loss_dict['base_loss'].item():.6f}"
+            if 'dice_loss' in loss_dict:
+                loss_info += f", Dice损失={loss_dict['dice_loss'].item():.6f}"
+            
+            tqdm.write(f"[详细] 批次 {batch_idx+1}: {loss_info}, "
+                      f"数据加载={epoch_stats['data_load_times'][-1]:.3f}s, "
+                      f"前向={epoch_stats['forward_times'][-1]:.3f}s, "
+                      f"反向={epoch_stats['backward_times'][-1]:.3f}s, "
                       f"ETA={eta_minutes:.1f}min")
     
     # 关闭训练进度条
@@ -438,19 +707,57 @@ def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler=None, use_
     
     # Epoch结束统计
     epoch_time = time.time() - epoch_start_time
-    avg_epoch_loss = epoch_loss / num_batches
+    num_batches = epoch_stats['num_batches']
     
-    print(f"\n{'='*60}")
+    # 计算平均损失
+    avg_total_loss = epoch_stats['total_loss'] / num_batches
+    avg_base_loss = epoch_stats['base_loss'] / num_batches if epoch_stats['base_loss'] > 0 else 0
+    avg_dice_loss = epoch_stats['dice_loss'] / num_batches if epoch_stats['dice_loss'] > 0 else 0
+    
+    # 计算平均时间
+    avg_batch_time = sum(epoch_stats['batch_times']) / len(epoch_stats['batch_times'])
+    avg_data_time = sum(epoch_stats['data_load_times']) / len(epoch_stats['data_load_times'])
+    avg_forward_time = sum(epoch_stats['forward_times']) / len(epoch_stats['forward_times'])
+    avg_backward_time = sum(epoch_stats['backward_times']) / len(epoch_stats['backward_times'])
+    
+    # GPU内存统计
+    if epoch_stats['gpu_memory_usage']:
+        avg_gpu_memory = sum(epoch_stats['gpu_memory_usage']) / len(epoch_stats['gpu_memory_usage'])
+        max_gpu_memory = max(epoch_stats['gpu_memory_usage'])
+    else:
+        avg_gpu_memory = max_gpu_memory = 0
+    
+    print(f"\n{'='*80}")
     print(f"Epoch {epoch_num + 1} 训练完成!")
-    print(f"总时间: {epoch_time:.2f}s ({epoch_time/60:.1f}min)")
-    print(f"平均批次时间: {sum(batch_times)/len(batch_times):.3f}s")
-    print(f"平均数据加载时间: {sum(data_load_times)/len(data_load_times):.3f}s")
-    print(f"平均前向传播时间: {sum(forward_times)/len(forward_times):.3f}s")
-    print(f"平均反向传播时间: {sum(backward_times)/len(backward_times):.3f}s")
-    print(f"平均训练损失: {avg_epoch_loss:.6f}")
-    print(f"{'='*60}\n")
+    print(f"{'='*80}")
+    print(f"时间统计:")
+    print(f"  总时间: {epoch_time:.2f}s ({epoch_time/60:.1f}min)")
+    print(f"  平均批次时间: {avg_batch_time:.3f}s")
+    print(f"  平均数据加载时间: {avg_data_time:.3f}s ({avg_data_time/avg_batch_time*100:.1f}%)")
+    print(f"  平均前向传播时间: {avg_forward_time:.3f}s ({avg_forward_time/avg_batch_time*100:.1f}%)")
+    print(f"  平均反向传播时间: {avg_backward_time:.3f}s ({avg_backward_time/avg_batch_time*100:.1f}%)")
+    print(f"损失统计:")
+    print(f"  平均总损失: {avg_total_loss:.6f}")
+    if avg_base_loss > 0:
+        print(f"  平均基础损失: {avg_base_loss:.6f}")
+    if avg_dice_loss > 0:
+        print(f"  平均Dice损失: {avg_dice_loss:.6f}")
+    if avg_gpu_memory > 0:
+        print(f"GPU内存统计:")
+        print(f"  平均使用: {avg_gpu_memory:.1f}GB")
+        print(f"  峰值使用: {max_gpu_memory:.1f}GB")
+    print(f"{'='*80}\n")
     
-    return avg_epoch_loss
+    # 返回详细的训练统计信息
+    return {
+        'avg_total_loss': avg_total_loss,
+        'avg_base_loss': avg_base_loss,
+        'avg_dice_loss': avg_dice_loss,
+        'epoch_time': epoch_time,
+        'avg_batch_time': avg_batch_time,
+        'avg_gpu_memory': avg_gpu_memory,
+        'max_gpu_memory': max_gpu_memory
+    }
 
 
 def validate(model, dataloader, loss_fn, device, args):
@@ -579,8 +886,19 @@ def validate(model, dataloader, loss_fn, device, args):
     return avg_val_loss, avg_dice, avg_hausdorff
 
 
-def save_checkpoint(model, optimizer, epoch, best_dice, args, filename):
-    """保存检查点"""
+def save_checkpoint(model, optimizer, scheduler, epoch, best_dice, patience_counter, args, filename):
+    """保存检查点
+    
+    参数:
+        model: 模型
+        optimizer: 优化器
+        scheduler: 学习率调度器
+        epoch: 当前epoch
+        best_dice: 最佳Dice分数
+        patience_counter: 早停计数器
+        args: 训练参数
+        filename: 保存文件名
+    """
     if args.distributed:
         model_state = model.module.state_dict()
     else:
@@ -590,11 +908,130 @@ def save_checkpoint(model, optimizer, epoch, best_dice, args, filename):
         'epoch': epoch,
         'model_state': model_state,
         'optimizer_state': optimizer.state_dict(),
+        'scheduler_state': scheduler.state_dict(),
         'best_dice': best_dice,
-        'args': args
+        'patience_counter': patience_counter,
+        'args': args,
+        'pytorch_version': torch.__version__
     }
     
     torch.save(state, filename)
+    print(f"检查点已保存: {filename}")
+
+
+def load_checkpoint(checkpoint_path, model, optimizer, scheduler, args):
+    """加载检查点恢复训练
+    
+    参数:
+        checkpoint_path: 检查点文件路径
+        model: 模型
+        optimizer: 优化器
+        scheduler: 学习率调度器
+        args: 训练参数
+        
+    返回:
+        tuple: (start_epoch, best_dice, patience_counter)
+    """
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"检查点文件不存在: {checkpoint_path}")
+    
+    print(f"正在加载检查点: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    
+    # 加载模型状态
+    if args.distributed:
+        model.module.load_state_dict(checkpoint['model_state'])
+    else:
+        model.load_state_dict(checkpoint['model_state'])
+    
+    # 加载优化器状态
+    optimizer.load_state_dict(checkpoint['optimizer_state'])
+    
+    # 加载调度器状态
+    if 'scheduler_state' in checkpoint:
+        scheduler.load_state_dict(checkpoint['scheduler_state'])
+    
+    # 获取训练状态
+    start_epoch = checkpoint['epoch'] + 1
+    best_dice = checkpoint.get('best_dice', 0)
+    patience_counter = checkpoint.get('patience_counter', 0)
+    
+    print(f"检查点加载完成 - Epoch: {start_epoch}, Best Dice: {best_dice:.4f}")
+    
+    return start_epoch, best_dice, patience_counter
+
+
+def load_pretrained_model(pretrained_path, model, args):
+    """加载预训练模型
+    
+    参数:
+        pretrained_path: 预训练模型路径
+        model: 模型
+        args: 训练参数
+    """
+    if not os.path.exists(pretrained_path):
+        raise FileNotFoundError(f"预训练模型文件不存在: {pretrained_path}")
+    
+    print(f"正在加载预训练模型: {pretrained_path}")
+    
+    # 尝试加载检查点格式
+    try:
+        checkpoint = torch.load(pretrained_path, map_location='cpu')
+        if 'model_state' in checkpoint:
+            pretrained_dict = checkpoint['model_state']
+        else:
+            pretrained_dict = checkpoint
+    except:
+        # 直接加载状态字典
+        pretrained_dict = torch.load(pretrained_path, map_location='cpu')
+    
+    # 获取当前模型的状态字典
+    if args.distributed:
+        model_dict = model.module.state_dict()
+    else:
+        model_dict = model.state_dict()
+    
+    # 过滤掉不匹配的键
+    filtered_dict = {}
+    for k, v in pretrained_dict.items():
+        if k in model_dict and v.shape == model_dict[k].shape:
+            filtered_dict[k] = v
+        else:
+            print(f"跳过不匹配的参数: {k}")
+    
+    # 更新模型参数
+    model_dict.update(filtered_dict)
+    
+    if args.distributed:
+        model.module.load_state_dict(model_dict)
+    else:
+        model.load_state_dict(model_dict)
+    
+    print(f"预训练模型加载完成，成功加载 {len(filtered_dict)}/{len(pretrained_dict)} 个参数")
+
+
+def save_training_config(args):
+    """保存训练配置到文件
+    
+    参数:
+        args: 训练参数
+    """
+    import json
+    
+    config_dict = vars(args).copy()
+    
+    # 转换不能JSON序列化的对象
+    for key, value in config_dict.items():
+        if isinstance(value, (list, tuple)):
+            config_dict[key] = list(value)
+        elif not isinstance(value, (str, int, float, bool, type(None))):
+            config_dict[key] = str(value)
+    
+    config_path = os.path.join(args.output_dir, 'training_config.json')
+    with open(config_path, 'w', encoding='utf-8') as f:
+        json.dump(config_dict, f, indent=2, ensure_ascii=False)
+    
+    print(f"训练配置已保存: {config_path}")
 
 
 def main():
@@ -623,6 +1060,10 @@ def main():
     os.makedirs(os.path.join(args.output_dir, 'checkpoints'), exist_ok=True)
     os.makedirs(os.path.join(args.output_dir, 'visualizations'), exist_ok=True)
     print(f"输出目录已创建: {args.output_dir}")
+    
+    # 保存训练配置
+    if args.rank == 0:
+        save_training_config(args)
     
     # 设置分布式训练
     setup_distributed(args)
@@ -683,15 +1124,13 @@ def main():
         model = DDP(model, device_ids=[args.local_rank], output_device=args.local_rank)
     
     # 创建优化器
-    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = get_optimizer(model, args)
     
     # 创建学习率调度器
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.5, patience=5
-    )
+    scheduler = get_scheduler(optimizer, args)
     
     # 获取损失函数
-    loss_fn = get_loss_function()
+    loss_fn = get_loss_function(args)
     
     # 创建混合精度训练的缩放器
     scaler = GradScaler() if args.amp else None
@@ -700,30 +1139,64 @@ def main():
     if args.rank == 0:
         writer = SummaryWriter(log_dir=os.path.join(args.output_dir, 'logs'))
     
-    # 训练循环
+    # 初始化训练状态
+    start_epoch = 0
     best_dice = 0
     patience_counter = 0
     
+    # 加载预训练模型或恢复训练
+    if args.resume:
+        start_epoch, best_dice, patience_counter = load_checkpoint(
+            args.resume, model, optimizer, scheduler, args
+        )
+        print(f"从检查点恢复训练: epoch {start_epoch}, best_dice {best_dice:.4f}")
+    elif args.pretrained:
+        load_pretrained_model(args.pretrained, model, args)
+        print(f"加载预训练模型: {args.pretrained}")
+    
+    # 如果只进行测试
+    if args.test_only:
+        print("仅进行测试评估...")
+        test_loss, test_dice, test_hausdorff = validate(model, test_loader, loss_fn, device, args)
+        print(f"测试结果 - 损失: {test_loss:.6f}, Dice: {test_dice:.6f}, Hausdorff: {test_hausdorff:.4f}")
+        return
+    
     # 创建总体训练进度条
     epoch_pbar = tqdm(
-        range(args.epochs),
+        range(start_epoch, args.epochs),
         desc="总体训练进度",
         unit="epoch",
         ncols=120,
-        position=0
+        position=0,
+        initial=start_epoch,
+        total=args.epochs
     )
     
     for epoch in epoch_pbar:
         # 训练一个epoch
-        train_loss = train_epoch(
-            model, train_loader, optimizer, loss_fn, device, scaler, args.amp, epoch
+        train_stats = train_epoch(
+            model, train_loader, optimizer, loss_fn, device, scaler, args.amp, epoch, args
         )
+        train_loss = train_stats['avg_total_loss']
         
-        # 验证
-        val_loss, val_dice, val_hausdorff = validate(model, val_loader, loss_fn, device, args)
-        
-        # 更新学习率
-        scheduler.step(val_dice)
+        # 验证（根据验证频率）
+        if (epoch + 1) % args.val_freq == 0:
+            val_loss, val_dice, val_hausdorff = validate(model, val_loader, loss_fn, device, args)
+            
+            # 更新学习率
+            if args.scheduler.lower() == 'plateau':
+                scheduler.step(val_dice)
+            else:
+                scheduler.step()
+        else:
+            # 如果不进行验证，使用上一次的验证结果
+            val_loss = val_loss if 'val_loss' in locals() else float('inf')
+            val_dice = val_dice if 'val_dice' in locals() else 0.0
+            val_hausdorff = val_hausdorff if 'val_hausdorff' in locals() else float('inf')
+            
+            # 对于非plateau调度器，仍需要step
+            if args.scheduler.lower() != 'plateau':
+                scheduler.step()
         
         # 更新总体进度条
         epoch_pbar.set_postfix({
@@ -759,11 +1232,27 @@ def main():
             
             tqdm.write(f"{'*'*80}\n")
             
-            writer.add_scalar('Loss/train', train_loss, epoch)
+            # 记录训练指标
+            writer.add_scalar('Loss/train_total', train_loss, epoch)
+            if 'avg_base_loss' in train_stats and train_stats['avg_base_loss'] > 0:
+                writer.add_scalar('Loss/train_base', train_stats['avg_base_loss'], epoch)
+            if 'avg_dice_loss' in train_stats and train_stats['avg_dice_loss'] > 0:
+                writer.add_scalar('Loss/train_dice', train_stats['avg_dice_loss'], epoch)
+            
+            # 记录验证指标
             writer.add_scalar('Loss/val', val_loss, epoch)
             writer.add_scalar('Metrics/dice', val_dice, epoch)
             writer.add_scalar('Metrics/hausdorff', val_hausdorff, epoch)
+            
+            # 记录学习率和性能指标
             writer.add_scalar('LR', optimizer.param_groups[0]['lr'], epoch)
+            writer.add_scalar('Performance/epoch_time', train_stats['epoch_time'], epoch)
+            writer.add_scalar('Performance/avg_batch_time', train_stats['avg_batch_time'], epoch)
+            
+            # 记录GPU内存使用
+            if train_stats['avg_gpu_memory'] > 0:
+                writer.add_scalar('Memory/avg_gpu_usage', train_stats['avg_gpu_memory'], epoch)
+                writer.add_scalar('Memory/max_gpu_usage', train_stats['max_gpu_memory'], epoch)
             
             # 可视化预测结果
             if (epoch + 1) % args.vis_freq == 0:
@@ -791,18 +1280,25 @@ def main():
             
             if args.rank == 0:
                 save_checkpoint(
-                    model, optimizer, epoch, best_dice, args,
+                    model, optimizer, scheduler, epoch, best_dice, patience_counter, args,
                     os.path.join(args.output_dir, 'checkpoints', 'best_model.pth')
                 )
                 tqdm.write(f'✓ 新的最佳模型已保存，Dice: {best_dice:.4f}')
         else:
             patience_counter += 1
         
-        # 保存最新模型
-        if args.rank == 0 and (epoch + 1) % 10 == 0:
+        # 保存定期检查点
+        if args.rank == 0 and (epoch + 1) % args.save_freq == 0:
             save_checkpoint(
-                model, optimizer, epoch, best_dice, args,
+                model, optimizer, scheduler, epoch, best_dice, patience_counter, args,
                 os.path.join(args.output_dir, 'checkpoints', f'model_epoch_{epoch+1}.pth')
+            )
+        
+        # 保存最新检查点（用于意外中断后恢复）
+        if args.rank == 0:
+            save_checkpoint(
+                model, optimizer, scheduler, epoch, best_dice, patience_counter, args,
+                os.path.join(args.output_dir, 'checkpoints', 'latest.pth')
             )
         
         # 早停
